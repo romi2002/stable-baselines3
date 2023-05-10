@@ -4,6 +4,7 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
+from torch.nn import MSELoss
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
@@ -153,6 +154,9 @@ class SAC(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
 
+        self.ls_loss = MSELoss()
+        self.la_loss = MSELoss()
+
         if _init_setup_model:
             self._setup_model()
 
@@ -273,6 +277,15 @@ class SAC(OffPolicyAlgorithm):
             q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+
+            lam_a = 5
+            lam_s = 1
+
+            if lam_a > 0:
+                actor_loss += lam_a * self.la_loss(replay_data.actions, actions_pi)
+            if lam_s > 0:
+                actor_loss += lam_s * self.ls_loss(next_actions, actions_pi)
+
             actor_losses.append(actor_loss.item())
 
             # Optimize the actor
