@@ -89,34 +89,37 @@ class SAC(OffPolicyAlgorithm):
     critic_target: ContinuousCritic
 
     def __init__(
-        self,
-        policy: Union[str, Type[SACPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 3e-4,
-        buffer_size: int = 1_000_000,  # 1e6
-        learning_starts: int = 100,
-        batch_size: int = 256,
-        tau: float = 0.005,
-        gamma: float = 0.99,
-        train_freq: Union[int, Tuple[int, str]] = 1,
-        gradient_steps: int = 1,
-        action_noise: Optional[ActionNoise] = None,
-        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
-        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
-        optimize_memory_usage: bool = False,
-        ent_coef: Union[str, float] = "auto",
-        target_update_interval: int = 1,
-        target_entropy: Union[str, float] = "auto",
-        use_sde: bool = False,
-        sde_sample_freq: int = -1,
-        use_sde_at_warmup: bool = False,
-        stats_window_size: int = 100,
-        tensorboard_log: Optional[str] = None,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        _init_setup_model: bool = True,
+            self,
+            policy: Union[str, Type[SACPolicy]],
+            env: Union[GymEnv, str],
+            learning_rate: Union[float, Schedule] = 3e-4,
+            buffer_size: int = 1_000_000,  # 1e6
+            learning_starts: int = 100,
+            batch_size: int = 256,
+            tau: float = 0.005,
+            gamma: float = 0.99,
+            train_freq: Union[int, Tuple[int, str]] = 1,
+            gradient_steps: int = 1,
+            action_noise: Optional[ActionNoise] = None,
+            replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
+            replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
+            optimize_memory_usage: bool = False,
+            ent_coef: Union[str, float] = "auto",
+            target_update_interval: int = 1,
+            target_entropy: Union[str, float] = "auto",
+            use_sde: bool = False,
+            sde_sample_freq: int = -1,
+            use_sde_at_warmup: bool = False,
+            stats_window_size: int = 100,
+            tensorboard_log: Optional[str] = None,
+            policy_kwargs: Optional[Dict[str, Any]] = None,
+            verbose: int = 0,
+            seed: Optional[int] = None,
+            device: Union[th.device, str] = "auto",
+            _init_setup_model: bool = True,
+            lambda_t: float = 1.0,
+            lambda_s: float = 5.0,
+            eps_s: float = 0.2
     ):
         super().__init__(
             policy,
@@ -146,6 +149,9 @@ class SAC(OffPolicyAlgorithm):
             support_multi_env=True,
         )
 
+        self.lambda_t = lambda_t
+        self.lambda_s = lambda_s
+        self.eps_s = eps_s
         self.target_entropy = target_entropy
         self.log_ent_coef = None  # type: Optional[th.Tensor]
         # Entropy coefficient / Entropy temperature
@@ -155,7 +161,7 @@ class SAC(OffPolicyAlgorithm):
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
 
         self.ls_loss = MSELoss()
-        self.la_loss = MSELoss()
+        self.lt_loss = MSELoss()
 
         if _init_setup_model:
             self._setup_model()
@@ -213,6 +219,7 @@ class SAC(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        lt_losses, ls_losses = [], []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -278,13 +285,18 @@ class SAC(OffPolicyAlgorithm):
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
 
-            lam_a = 5
-            lam_s = 1
+            # Sample actions around current state
+            xbar = th.Tensor(np.random.normal(replay_data.observations.cpu().numpy(), self.eps_s)).to(self.device)
+            action_xbar, _ = self.actor.action_log_prob(xbar)
 
-            if lam_a > 0:
-                actor_loss += lam_a * self.la_loss(replay_data.actions, actions_pi)
-            if lam_s > 0:
-                actor_loss += lam_s * self.ls_loss(next_actions, actions_pi)
+            if self.lambda_t > 0:
+                lt = self.lambda_t * self.lt_loss(next_actions, actions_pi)
+                actor_loss += lt
+                lt_losses.append(lt.detach().cpu().numpy())
+            if self.lambda_s > 0:
+                ls = self.lambda_s * self.ls_loss(action_xbar, actions_pi)
+                actor_loss += ls
+                ls_losses.append(ls.detach().cpu().numpy())
 
             actor_losses.append(actor_loss.item())
 
@@ -305,17 +317,19 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/lt_loss", np.mean(lt_losses))
+        self.logger.record("train/ls_loss", np.mean(ls_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
     def learn(
-        self: SelfSAC,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 4,
-        tb_log_name: str = "SAC",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
+            self: SelfSAC,
+            total_timesteps: int,
+            callback: MaybeCallback = None,
+            log_interval: int = 4,
+            tb_log_name: str = "SAC",
+            reset_num_timesteps: bool = True,
+            progress_bar: bool = False,
     ) -> SelfSAC:
         return super().learn(
             total_timesteps=total_timesteps,
